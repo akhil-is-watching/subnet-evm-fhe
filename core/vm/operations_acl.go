@@ -33,6 +33,7 @@ import (
 	"github.com/ava-labs/subnet-evm/vmerrs"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/zama-ai/fhevm-go/fhevm"
 )
 
 func makeGasSStoreFunc() gasFunc {
@@ -66,6 +67,10 @@ func makeGasSStoreFunc() gasFunc {
 			// EIP 2200 original clause:
 			//		return params.SloadGasEIP2200, nil
 			return cost + params.WarmStorageReadCostEIP2929, nil // SLOAD_GAS
+		}
+		ct := fhevm.GetCiphertextFromMemory(evm.FhevmEnvironment(), value)
+		if ct != nil {
+			cost += evm.fhevmEnvironment.params.GasCosts.FheStorageSstoreGas[ct.Type()]
 		}
 		original := evm.StateDB.GetCommittedState(contract.Address(), x.Bytes32())
 		if original == current {

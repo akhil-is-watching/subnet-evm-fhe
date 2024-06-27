@@ -29,6 +29,9 @@ package vm
 import (
 	"errors"
 	"fmt"
+
+	"github.com/ava-labs/subnet-evm/vmerrs"
+	"github.com/zama-ai/fhevm-go/fhevm"
 )
 
 // List evm execution errors
@@ -37,6 +40,13 @@ var (
 	// never returned to outside callers.
 	errStopToken = errors.New("stop token")
 )
+
+func init() {
+	fhevm.RegisterErrors(vmerrs.ErrOutOfGas, vmerrs.ErrCodeStoreOutOfGas, vmerrs.ErrDepth, vmerrs.ErrInsufficientBalance,
+		vmerrs.ErrContractAddressCollision, vmerrs.ErrExecutionReverted, vmerrs.ErrMaxInitCodeSizeExceeded, vmerrs.ErrMaxCodeSizeExceeded,
+		vmerrs.ErrInvalidJump, vmerrs.ErrWriteProtection, vmerrs.ErrReturnDataOutOfBounds, vmerrs.ErrGasUintOverflow, vmerrs.ErrInvalidCode,
+		vmerrs.ErrNonceUintOverflow, nil, nil, nil)
+}
 
 // ErrStackUnderflow wraps an evm error when the items on the stack less
 // than the minimal requirement.

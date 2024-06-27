@@ -27,6 +27,7 @@
 package vm
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 	"sync/atomic"
@@ -44,6 +45,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
+	"github.com/zama-ai/fhevm-go/fhevm"
 )
 
 var (
@@ -71,8 +73,8 @@ type (
 	GetHashFunc func(uint64) common.Hash
 )
 
-func (evm *EVM) precompile(addr common.Address) (contract.StatefulPrecompiledContract, bool) {
-	var precompiles map[common.Address]contract.StatefulPrecompiledContract
+func (evm *EVM) precompile(addr common.Address) (PrecompiledContract, bool) {
+	var precompiles map[common.Address]PrecompiledContract
 	switch {
 	case evm.chainRules.IsCancun:
 		precompiles = PrecompiledContractsCancun
@@ -90,12 +92,6 @@ func (evm *EVM) precompile(addr common.Address) (contract.StatefulPrecompiledCon
 	p, ok := precompiles[addr]
 	if ok {
 		return p, true
-	}
-
-	// Otherwise, check the chain rules for the additionally configured precompiles.
-	if _, ok = evm.chainRules.ActivePrecompiles[addr]; ok {
-		module, ok := modules.GetPrecompileModuleByAddress(addr)
-		return module.Contract, ok
 	}
 
 	return nil, false
@@ -150,6 +146,14 @@ type TxContext struct {
 	BlobFeeCap *big.Int       // Is used to zero the blobbasefee if NoBaseFee is set
 }
 
+// FhevmImplementation wraps an EVM interpreter with a FHEVM implementation
+type FhevmImplementation struct {
+	interpreter *EVMInterpreter
+	data        fhevm.FhevmData
+	logger      fhevm.Logger
+	params      fhevm.FhevmParams
+}
+
 // EVM is the Ethereum Virtual Machine base object and provides
 // the necessary tools to run a contract on the given state with
 // the provided context. It should be noted that any error
@@ -183,7 +187,10 @@ type EVM struct {
 	// callGasTemp holds the gas available for the current call. This is needed because the
 	// available gas is calculated in gasCall* according to the 63/64 rule and later
 	// applied in opCall*.
-	callGasTemp uint64
+	callGasTemp      uint64
+	fhevmEnvironment FhevmImplementation
+	isGasEstimation  bool
+	isEthCall        bool
 }
 
 // NewEVM returns a new EVM. The returned EVM is not thread safe and should
@@ -201,14 +208,19 @@ func NewEVM(blockCtx BlockContext, txCtx TxContext, statedb StateDB, chainConfig
 		}
 	}
 	evm := &EVM{
-		Context:     blockCtx,
-		TxContext:   txCtx,
-		StateDB:     statedb,
-		Config:      config,
-		chainConfig: chainConfig,
-		chainRules:  chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Time),
+		Context:          blockCtx,
+		TxContext:        txCtx,
+		StateDB:          statedb,
+		Config:           config,
+		chainConfig:      chainConfig,
+		chainRules:       chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Time),
+		isGasEstimation:  config.IsGasEstimation,
+		isEthCall:        config.IsEthCall,
+		fhevmEnvironment: FhevmImplementation{interpreter: nil, logger: &fhevm.DefaultLogger{}, data: fhevm.NewFhevmData(), params: fhevm.DefaultFhevmParams()},
 	}
 	evm.interpreter = NewEVMInterpreter(evm)
+	evm.fhevmEnvironment.interpreter = evm.interpreter
+	fhevm.InitFhevm(&evm.fhevmEnvironment)
 	return evm
 }
 
@@ -305,7 +317,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 	}
 
 	if isPrecompile {
-		ret, gas, err = RunStatefulPrecompiledContract(p, evm, caller.Address(), addr, input, gas, evm.interpreter.readOnly)
+		ret, gas, err = RunPrecompiledContract(p, evm, caller.Address(), addr, input, gas)
 	} else {
 		// Initialise a new contract and set the code that is to be used by the EVM.
 		// The contract is a scoped environment for this execution context only.
@@ -371,7 +383,7 @@ func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, 
 
 	// It is allowed to call precompiles, even via delegatecall
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
-		ret, gas, err = RunStatefulPrecompiledContract(p, evm, caller.Address(), addr, input, gas, evm.interpreter.readOnly)
+		ret, gas, err = RunPrecompiledContract(p, evm, caller.Address(), addr, input, gas)
 	} else {
 		addrCopy := addr
 		// Initialise a new contract and set the code that is to be used by the EVM.
@@ -416,7 +428,7 @@ func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []by
 
 	// It is allowed to call precompiles, even via delegatecall
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
-		ret, gas, err = RunStatefulPrecompiledContract(p, evm, caller.Address(), addr, input, gas, evm.interpreter.readOnly)
+		ret, gas, err = RunPrecompiledContract(p, evm, caller.Address(), addr, input, gas)
 	} else {
 		addrCopy := addr
 		// Initialise a new contract and make initialise the delegate values
@@ -465,7 +477,7 @@ func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte
 	}
 
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
-		ret, gas, err = RunStatefulPrecompiledContract(p, evm, caller.Address(), addr, input, gas, true)
+		ret, gas, err = RunPrecompiledContract(p, evm, caller.Address(), addr, input, gas)
 	} else {
 		// At this point, we use a copy of address. If we don't, the go compiler will
 		// leak the 'contract' to the outer scope, and make allocation for 'contract'
@@ -630,3 +642,72 @@ func (evm *EVM) ChainConfig() *params.ChainConfig { return evm.chainConfig }
 
 // GetChainConfig implements AccessibleState
 func (evm *EVM) GetChainConfig() precompileconfig.ChainConfig { return evm.chainConfig }
+
+func (evm *EVM) FhevmEnvironment() fhevm.EVMEnvironment { return &evm.fhevmEnvironment }
+
+// If you are using OpenTelemetry, you can return a context that the precompiled fhelib will use
+// to trace its internal functions. Otherwise, just return nil
+func (evm *FhevmImplementation) OtelContext() context.Context {
+	return nil
+}
+
+func (evm *FhevmImplementation) GetState(addr common.Address, hash common.Hash) common.Hash {
+	return evm.interpreter.evm.StateDB.GetState(addr, hash)
+}
+
+func (evm *FhevmImplementation) SetState(addr common.Address, hash common.Hash, input common.Hash) {
+	evm.interpreter.evm.StateDB.SetState(addr, hash, input)
+}
+
+func (evm *FhevmImplementation) GetNonce(addr common.Address) uint64 {
+	return evm.interpreter.evm.StateDB.GetNonce(addr)
+}
+
+func (evm *FhevmImplementation) AddBalance(addr common.Address, value *big.Int) {
+	evm.interpreter.evm.StateDB.AddBalance(addr, value)
+}
+
+func (evm *FhevmImplementation) GetBalance(addr common.Address) *big.Int {
+	return evm.interpreter.evm.StateDB.GetBalance(addr)
+}
+
+func (evm *FhevmImplementation) Suicide(addr common.Address) bool {
+	evm.interpreter.evm.StateDB.SelfDestruct(addr)
+	return evm.interpreter.evm.StateDB.HasSelfDestructed(addr)
+}
+
+func (evm *FhevmImplementation) GetDepth() int {
+	return evm.interpreter.evm.depth
+}
+
+func (evm *FhevmImplementation) IsCommitting() bool {
+	return !evm.interpreter.evm.isGasEstimation
+}
+
+func (evm *FhevmImplementation) IsEthCall() bool {
+	return evm.interpreter.evm.isEthCall
+}
+
+func (evm *FhevmImplementation) IsReadOnly() bool {
+	return evm.interpreter.readOnly
+}
+
+func (evm *FhevmImplementation) GetLogger() fhevm.Logger {
+	return evm.logger
+}
+
+func (evm *FhevmImplementation) FhevmData() *fhevm.FhevmData {
+	return &evm.data
+}
+
+func (evm *FhevmImplementation) FhevmParams() *fhevm.FhevmParams {
+	return &evm.params
+}
+
+func (evm *FhevmImplementation) CreateContract(caller common.Address, code []byte, gas uint64, value *big.Int, address common.Address) ([]byte, common.Address, uint64, error) {
+	return evm.interpreter.evm.create(AccountRef(caller), &codeAndHash{code: code}, gas, value, address, CREATE)
+}
+
+func (evm *FhevmImplementation) CreateContract2(caller common.Address, code []byte, codeHash common.Hash, gas uint64, value *big.Int, address common.Address) ([]byte, common.Address, uint64, error) {
+	return evm.interpreter.evm.create(AccountRef(caller), &codeAndHash{code: code, hash: codeHash}, gas, value, address, CREATE2)
+}

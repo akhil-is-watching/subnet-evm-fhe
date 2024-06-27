@@ -55,7 +55,10 @@ func (c *crossChainHandler) HandleEthCallRequest(ctx context.Context, requesting
 		nil,
 		nil,
 		c.backend.RPCEVMTimeout(),
-		c.backend.RPCGasCap())
+		c.backend.RPCGasCap(),
+		false,
+		true,
+	)
 	if err != nil {
 		log.Error("error occurred with EthCall", "err", err, "transactionArgs", ethCallRequest.RequestArgs, "blockNumberOrHash", lastAcceptedBlockNumberOrHash)
 		return nil, nil

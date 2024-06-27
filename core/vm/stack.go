@@ -54,6 +54,14 @@ func returnStack(s *Stack) {
 	stackPool.Put(s)
 }
 
+func (st *Stack) Pop() uint256.Int {
+	return st.pop()
+}
+
+func (st *Stack) Peek() *uint256.Int {
+	return st.peek()
+}
+
 // Data returns the underlying uint256.Int array.
 func (st *Stack) Data() []uint256.Int {
 	return st.data
